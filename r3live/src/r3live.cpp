@@ -84,9 +84,9 @@ Dr. Fu Zhang < fuzhang@hku.hk >.
 #include "tools_timer.hpp"
 #include "tools_openCV_3_to_4.hpp"
 
-Camera_Lidar_queue g_camera_lidar_queue;
+// Camera_Lidar_queue g_camera_lidar_queue;
 MeasureGroup Measures;
-StatesGroup g_lio_state;
+// StatesGroup g_lio_state;
 std::string data_dump_dir = std::string("/mnt/0B3B134F0B3B134F/color_temp_r3live/");
 
 int main(int argc, char **argv)

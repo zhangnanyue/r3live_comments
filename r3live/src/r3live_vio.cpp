@@ -164,7 +164,7 @@ void R3LIVE::print_dash_board() {
 }
 
 // 初始化P矩阵
-// 
+// r, p, v, bg, ba, g, r_i_c, p_i_c, td, camera_intrinsic
 void R3LIVE::set_initial_state_cov(StatesGroup &state) {
   // Set cov
   scope_color(ANSI_COLOR_RED_BOLD);
@@ -178,13 +178,17 @@ void R3LIVE::set_initial_state_cov(StatesGroup &state) {
   state.cov.block(9, 9, 3, 3) = mat_3_3::Identity() * 1e-3;   // bias_g
   state.cov.block(12, 12, 3, 3) = mat_3_3::Identity() * 1e-1; // bias_a
   state.cov.block(15, 15, 3, 3) = mat_3_3::Identity() * 1e-5; // Gravity
+  // Extrinsic between camera and IMU.
+  state.cov.block(18, 18, 6, 6) =
+      state.cov.block(18, 18, 6, 6).setIdentity() * 1e-3;
+  // time offset.
   state.cov(24, 24) = 0.00001;
-  state.cov.block(18, 18, 6, 6) = state.cov.block(18, 18, 6, 6).setIdentity() *
-                                  1e-3; // Extrinsic between camera and IMU.
+  // Camera intrinsic.
   state.cov.block(25, 25, 4, 4) =
-      state.cov.block(25, 25, 4, 4).setIdentity() * 1e-3; // Camera intrinsic.
+      state.cov.block(25, 25, 4, 4).setIdentity() * 1e-3;
 }
 
+// 生成保存pcd文件的交互panel界面
 cv::Mat R3LIVE::generate_control_panel_img() {
   int line_y = 40;
   int padding_x = 10;
@@ -207,6 +211,7 @@ cv::Mat R3LIVE::generate_control_panel_img() {
   return res_image;
 }
 
+// 设置相机参数，包括相机的内参数，相机到imu的外参数，相机的畸变参数
 void R3LIVE::set_initial_camera_parameter(
     StatesGroup &state, double *intrinsic_data, double *camera_dist_data,
     double *imu_camera_ext_R, double *imu_camera_ext_t, double cam_k_scale) {
@@ -275,10 +280,14 @@ void R3LIVE::publish_raw_img(cv::Mat &img) {
 int sub_image_typed = 0; // 0: TBD 1: sub_raw, 2: sub_comp
 std::mutex mutex_image_callback;
 
+// 1. 第一个循环防止类型为Image_frame的buffer里消息数量太多
+// 2. 处理comprssed_img
+//  2.1 循环防止sensor_msgs::CompressedImageConstPtr类型队列为空
+//  2.2 生成cv::Mat图像和获取时间
+//  2.3 调用process_image进行处理
 std::deque<sensor_msgs::CompressedImageConstPtr> g_received_compressed_img_msg;
 std::deque<sensor_msgs::ImageConstPtr> g_received_img_msg;
 std::shared_ptr<std::thread> g_thr_process_image;
-
 void R3LIVE::service_process_img_buffer() {
   while (1) {
     // To avoid uncompress so much image buffer, reducing the use of memory.
@@ -330,8 +339,12 @@ void R3LIVE::service_process_img_buffer() {
   }
 }
 
+// 1. 将所有sensor_msgs::CompressedImageConstPtr类型数据压入队列中
+// 2. 开启service_process_img_buffer线程
 void R3LIVE::image_comp_callback(
     const sensor_msgs::CompressedImageConstPtr &msg) {
+std:
+  cout << "entry image_compressed_callback" << std::endl;
   std::unique_lock<std::mutex> lock2(mutex_image_callback);
   if (sub_image_typed == 1) {
     return; // Avoid subscribe the same image twice.
@@ -364,6 +377,17 @@ void R3LIVE::image_callback(const sensor_msgs::ImageConstPtr &msg) {
   process_image(temp_img, msg->header.stamp.toSec());
 }
 
+// 0. 检测时间戳
+// 1. 如果是第一帧图像
+// 1.1 初始化第一帧时间
+// 1.2 初始化图像downsample因子
+// 1.3 调用R3LIVE::set_initial_camera_parameter设置相机参数及sate的初始P矩阵
+// 1.4
+// 设置相机内参，畸变参数，畸变映射矩阵，开启线程R3LIVE::service_pub_rgb_maps和R3LIVE::service_VIO_update
+// 1.5 一些关于record的操作
+// 2. 根据是否进行下采样，对图像进行resize
+// 3. 创建类型为Image_frame的类对象，并进行初始化，直方图化等设置
+// 4. 将Image_frame的类对象塞入队列中
 double last_accept_time = 0;
 int buffer_max_frame = 0;
 int total_frame_count = 0;
@@ -431,7 +455,7 @@ void R3LIVE::process_image(cv::Mat &temp_img, double msg_time) {
     buffer_max_frame = m_queue_image_with_pose.size();
   }
 
-  // cout << "Image queue size = " << m_queue_image_with_pose.size() << endl;
+  cout << "Image queue size = " << m_queue_image_with_pose.size() << endl;
 }
 
 void R3LIVE::load_vio_parameters() {
@@ -482,6 +506,9 @@ void R3LIVE::load_vio_parameters() {
   std::this_thread::sleep_for(std::chrono::seconds(1));
 }
 
+// 1. 将lio里的状态通过外参数传给相机
+// 2. 设置相机的内参数fx, fy, cx, cy
+// 3. 设置相机的内参数矩阵
 void R3LIVE::set_image_pose(std::shared_ptr<Image_frame> &image_pose,
                             const StatesGroup &state) {
   mat_3_3 rot_mat = state.rot_end;
@@ -498,68 +525,12 @@ void R3LIVE::set_image_pose(std::shared_ptr<Image_frame> &image_pose,
   image_pose->m_cam_K << image_pose->fx, 0, image_pose->cx, 0, image_pose->fy,
       image_pose->cy, 0, 0, 1;
   scope_color(ANSI_COLOR_CYAN_BOLD);
-  // cout << "Set Image Pose frm [" << image_pose->m_frame_idx << "], pose: " <<
-  // eigen_q(rot_mat).coeffs().transpose()
-  // << " | " << t_vec.transpose()
-  // << " | " << eigen_q(rot_mat).angularDistance( eigen_q::Identity()) *57.3 <<
-  // endl; image_pose->inverse_pose();
+  cout << "Set Image Pose frm [" << image_pose->m_frame_idx
+       << "], pose: " << eigen_q(rot_mat).coeffs().transpose() << " | "
+       << t_vec.transpose() << " | "
+       << eigen_q(rot_mat).angularDistance(eigen_q::Identity()) * 57.3 << endl;
+  image_pose->inverse_pose();
 }
-
-void R3LIVE::publish_camera_odom(std::shared_ptr<Image_frame> &image,
-                                 double msg_time) {
-  eigen_q odom_q = image->m_pose_w2c_q;
-  vec_3 odom_t = image->m_pose_w2c_t;
-  nav_msgs::Odometry camera_odom;
-  camera_odom.header.frame_id = "world";
-  camera_odom.child_frame_id = "/aft_mapped";
-  camera_odom.header.stamp =
-      ros::Time::now(); // ros::Time().fromSec(last_timestamp_lidar);
-  camera_odom.pose.pose.orientation.x = odom_q.x();
-  camera_odom.pose.pose.orientation.y = odom_q.y();
-  camera_odom.pose.pose.orientation.z = odom_q.z();
-  camera_odom.pose.pose.orientation.w = odom_q.w();
-  camera_odom.pose.pose.position.x = odom_t(0);
-  camera_odom.pose.pose.position.y = odom_t(1);
-  camera_odom.pose.pose.position.z = odom_t(2);
-  pub_odom_cam.publish(camera_odom);
-
-  geometry_msgs::PoseStamped msg_pose;
-  msg_pose.header.stamp = ros::Time().fromSec(msg_time);
-  msg_pose.header.frame_id = "world";
-  msg_pose.pose.orientation.x = odom_q.x();
-  msg_pose.pose.orientation.y = odom_q.y();
-  msg_pose.pose.orientation.z = odom_q.z();
-  msg_pose.pose.orientation.w = odom_q.w();
-  msg_pose.pose.position.x = odom_t(0);
-  msg_pose.pose.position.y = odom_t(1);
-  msg_pose.pose.position.z = odom_t(2);
-  camera_path.header.frame_id = "world";
-  camera_path.poses.push_back(msg_pose);
-  pub_path_cam.publish(camera_path);
-}
-
-void R3LIVE::publish_track_pts(Rgbmap_tracker &tracker) {
-  pcl::PointXYZRGB temp_point;
-  pcl::PointCloud<pcl::PointXYZRGB> pointcloud_for_pub;
-
-  for (auto it : tracker.m_map_rgb_pts_in_current_frame_pos) {
-    vec_3 pt = ((RGB_pts *)it.first)->get_pos();
-    cv::Scalar color = ((RGB_pts *)it.first)->m_dbg_color;
-    temp_point.x = pt(0);
-    temp_point.y = pt(1);
-    temp_point.z = pt(2);
-    temp_point.r = color(2);
-    temp_point.g = color(1);
-    temp_point.b = color(0);
-    pointcloud_for_pub.points.push_back(temp_point);
-  }
-  sensor_msgs::PointCloud2 ros_pc_msg;
-  pcl::toROSMsg(pointcloud_for_pub, ros_pc_msg);
-  ros_pc_msg.header.stamp = ros::Time::now(); //.fromSec(last_timestamp_lidar);
-  ros_pc_msg.header.frame_id = "world";       // world; camera_init
-  m_pub_visual_tracked_3d_pts.publish(ros_pc_msg);
-}
-
 // ANCHOR - VIO preintegration
 bool R3LIVE::vio_preintegration(StatesGroup &state_in, StatesGroup &state_out,
                                 double current_frame_time) {
@@ -1092,6 +1063,61 @@ void R3LIVE::publish_render_pts(ros::Publisher &pts_pub,
   pts_pub.publish(ros_pc_msg);
 }
 
+void R3LIVE::publish_camera_odom(std::shared_ptr<Image_frame> &image,
+                                 double msg_time) {
+  eigen_q odom_q = image->m_pose_w2c_q;
+  vec_3 odom_t = image->m_pose_w2c_t;
+  nav_msgs::Odometry camera_odom;
+  camera_odom.header.frame_id = "world";
+  camera_odom.child_frame_id = "/aft_mapped";
+  camera_odom.header.stamp =
+      ros::Time::now(); // ros::Time().fromSec(last_timestamp_lidar);
+  camera_odom.pose.pose.orientation.x = odom_q.x();
+  camera_odom.pose.pose.orientation.y = odom_q.y();
+  camera_odom.pose.pose.orientation.z = odom_q.z();
+  camera_odom.pose.pose.orientation.w = odom_q.w();
+  camera_odom.pose.pose.position.x = odom_t(0);
+  camera_odom.pose.pose.position.y = odom_t(1);
+  camera_odom.pose.pose.position.z = odom_t(2);
+  pub_odom_cam.publish(camera_odom);
+
+  geometry_msgs::PoseStamped msg_pose;
+  msg_pose.header.stamp = ros::Time().fromSec(msg_time);
+  msg_pose.header.frame_id = "world";
+  msg_pose.pose.orientation.x = odom_q.x();
+  msg_pose.pose.orientation.y = odom_q.y();
+  msg_pose.pose.orientation.z = odom_q.z();
+  msg_pose.pose.orientation.w = odom_q.w();
+  msg_pose.pose.position.x = odom_t(0);
+  msg_pose.pose.position.y = odom_t(1);
+  msg_pose.pose.position.z = odom_t(2);
+  camera_path.header.frame_id = "world";
+  camera_path.poses.push_back(msg_pose);
+  pub_path_cam.publish(camera_path);
+}
+
+void R3LIVE::publish_track_pts(Rgbmap_tracker &tracker) {
+  pcl::PointXYZRGB temp_point;
+  pcl::PointCloud<pcl::PointXYZRGB> pointcloud_for_pub;
+
+  for (auto it : tracker.m_map_rgb_pts_in_current_frame_pos) {
+    vec_3 pt = ((RGB_pts *)it.first)->get_pos();
+    cv::Scalar color = ((RGB_pts *)it.first)->m_dbg_color;
+    temp_point.x = pt(0);
+    temp_point.y = pt(1);
+    temp_point.z = pt(2);
+    temp_point.r = color(2);
+    temp_point.g = color(1);
+    temp_point.b = color(0);
+    pointcloud_for_pub.points.push_back(temp_point);
+  }
+  sensor_msgs::PointCloud2 ros_pc_msg;
+  pcl::toROSMsg(pointcloud_for_pub, ros_pc_msg);
+  ros_pc_msg.header.stamp = ros::Time::now(); //.fromSec(last_timestamp_lidar);
+  ros_pc_msg.header.frame_id = "world";       // world; camera_init
+  m_pub_visual_tracked_3d_pts.publish(ros_pc_msg);
+}
+
 char R3LIVE::cv_keyboard_callback() {
   char c = cv_wait_key(1);
   // return c;
@@ -1106,6 +1132,40 @@ char R3LIVE::cv_keyboard_callback() {
   }
   return c;
 }
+
+// 1. 调用op_track.set_intrinsic() (Rgbmap_tracker类)
+// 设置内参，畸变参数，图像大小参数
+// 2. 设置m_map_rgb_pts(Global_map类)的最大跟踪点，最大深度，最小深度
+// 3. 调用cv::Mat R3LIVE::generate_control_panel_img()显示面板
+// 4. 进入主循环
+//  4.1 调用char R3LIVE::cv_keyboard_callback()处理键盘输入
+//  4.2 检查g_camera_lidar_queue.m_if_have_lidar_data
+//  (Camera_Lidar_queue类)是否收到第一帧激光雷达扫描，没收到，则循环等待
+//  4.3
+//  检查预处理后的图像队列m_queue_image_with_pose(image_frame类)是否为空，为空则循环等待
+//  4.4 检查m_queue_image_with_pose队列是否大于max_buffer，如果是，则调用void
+//  op_track.track_img() (Rgbmap_tracker类),
+//  然后pop掉；否则直接获取预处理后的图像，然后pop掉
+//  4.5 设置上一帧image时间+timeoffset，且调用img_pose->set_frame_idx()
+//  (Image_frame类)设置g_camera_frame_idx
+//  4.6 如果g_camera_frame_idx是第一帧，且地图点数量>100个
+//    4.6.1 假设是静止的运动状态，调用void R3LIVE::set_image_pose()设置相机状态
+//    4.6.2 调用m_map_rgb_pts.selection_points_for_projection()
+//    (Global_map类)，根据相机状态，选择一些投影点
+//    4.6.3 调用op_track.init() (Rgbmap_tracker类)，初始化跟踪器
+//  4.7 g_camera_frame_idx++;
+//  4.8 调用g_camera_lidar_queue.if_camera_can_process() (Camera_Lidar_queue类)
+//      判断是否可以处理当前帧图像，否则循环等待雷达数据，标准为：
+//      当雷达有数据，并且lidar buffer中最旧的雷达数据时间 大于
+//      当前正在处理的图像时间戳
+//  4.9 调用bool R3LIVE::vio_preintegration()，做vio预积分
+//  4.10 调用void R3LIVE::set_image_pose()，根据上一步预积分结果，设置相机状态
+//  4.11 调用void op_track.track_img() (Rgbmap_tracker类)
+//  4.12 调用void R3LIVE::set_image_pose()，根据上一步跟踪结果，设置相机状态
+//  4.13
+//  调用op_track.remove_outlier_using_ransac_pnp(Rgbmap_tracker类)进行外点去除
+//  4.14 调用void R3LIVE::wait_render_thread_finish() 等待渲染线程完成工作
+//  4.15 调用bool R3LIVE::vio_esikf(), 依据重投影误差，更新优化状态量state_out
 
 // ANCHOR -  service_VIO_update
 void R3LIVE::service_VIO_update() {
@@ -1134,11 +1194,13 @@ void R3LIVE::service_VIO_update() {
       std::this_thread::yield();
       continue;
     }
+
     m_camera_data_mutex.lock();
     while (m_queue_image_with_pose.size() > m_maximum_image_buffer) {
-      cout << ANSI_COLOR_BLUE_BOLD << "=== Pop image! current queue size = "
-           << m_queue_image_with_pose.size() << " ===" << ANSI_COLOR_RESET
-           << endl;
+      std::cout << ANSI_COLOR_BLUE_BOLD
+                << "=== Pop image! current queue size = "
+                << m_queue_image_with_pose.size() << " ===" << ANSI_COLOR_RESET
+                << std::endl;
       op_track.track_img(m_queue_image_with_pose.front(), -20);
       m_queue_image_with_pose.pop_front();
     }
@@ -1147,6 +1209,7 @@ void R3LIVE::service_VIO_update() {
     double message_time = img_pose->m_timestamp;
     m_queue_image_with_pose.pop_front();
     m_camera_data_mutex.unlock();
+
     g_camera_lidar_queue.m_last_visual_time =
         img_pose->m_timestamp + g_lio_state.td_ext_i2c;
 
@@ -1154,16 +1217,20 @@ void R3LIVE::service_VIO_update() {
     tim.tic("Frame");
 
     if (g_camera_frame_idx == 0) {
+      // 选中的地图点反投影到图像上的坐标
       std::vector<cv::Point2f> pts_2d_vec;
+      // 选中的地图点
       std::vector<std::shared_ptr<RGB_pts>> rgb_pts_vec;
       // while ( ( m_map_rgb_pts.is_busy() ) || ( (
       // m_map_rgb_pts.m_rgb_pts_vec.size() <= 100 ) ) )
+      // 检查地图点是否足够
       while (((m_map_rgb_pts.m_rgb_pts_vec.size() <= 100))) {
+        // 地图点太少，等待数据累积
         ros::spinOnce();
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
-      set_image_pose(img_pose, g_lio_state); // For first frame pose, we suppose
-                                             // that the motion is static.
+      // For first frame pose, we suppose that the motion is static.
+      set_image_pose(img_pose, g_lio_state);
       m_map_rgb_pts.selection_points_for_projection(
           img_pose, &rgb_pts_vec, &pts_2d_vec,
           m_track_windows_size / m_vio_scale_factor);
@@ -1180,6 +1247,7 @@ void R3LIVE::service_VIO_update() {
       std::this_thread::yield();
       cv_keyboard_callback();
     }
+
     g_cost_time_logger.record(tim, "Wait");
     m_mutex_lio_process.lock();
     tim.tic("Frame");
@@ -1203,9 +1271,9 @@ void R3LIVE::service_VIO_update() {
 
     // ANCHOR -  remove point using PnP.
     if (op_track.remove_outlier_using_ransac_pnp(img_pose) == 0) {
-      cout << ANSI_COLOR_RED_BOLD
-           << "****** Remove_outlier_using_ransac_pnp error*****"
-           << ANSI_COLOR_RESET << endl;
+      std::cout << ANSI_COLOR_RED_BOLD
+                << "****** Remove_outlier_using_ransac_pnp error*****"
+                << ANSI_COLOR_RESET << std::endl;
     }
     g_cost_time_logger.record(tim, "Ransac");
     tim.tic("Vio_f2f");
