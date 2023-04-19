@@ -506,7 +506,8 @@ void R3LIVE::load_vio_parameters() {
   std::this_thread::sleep_for(std::chrono::seconds(1));
 }
 
-// 1. 将lio里的状态通过外参数传给相机
+// 1.
+// 将state状态（imu坐标系下）通过外参数传给相机，设置相机在世界坐标系下的位姿，相机的内参等
 // 2. 设置相机的内参数fx, fy, cx, cy
 // 3. 设置相机的内参数矩阵
 void R3LIVE::set_image_pose(std::shared_ptr<Image_frame> &image_pose,
@@ -531,14 +532,22 @@ void R3LIVE::set_image_pose(std::shared_ptr<Image_frame> &image_pose,
        << eigen_q(rot_mat).angularDistance(eigen_q::Identity()) * 57.3 << endl;
   image_pose->inverse_pose();
 }
+// 0. 入参包括：lidar状态(StatesGroup类)，
+//    补偿td_ext_i2c后的相机帧时间戳，出参：此时camera时间戳的预积分后的状态(StatesGroup类)
+// 1. 防止时间错乱，该次相机帧时间戳必须大于上次更新时间戳
+// 2. 循环imu数据buff，获取imu数据，时间戳小于等于当前相机帧的时间戳
+// 3. 始终保留当前相机时间戳200ms之内的imu数据，其他都丢弃
+// 4. 调用m_imu_process->imu_preintegration (ImuProcess类)做imu预积分
+
 // ANCHOR - VIO preintegration
 bool R3LIVE::vio_preintegration(StatesGroup &state_in, StatesGroup &state_out,
                                 double current_frame_time) {
   state_out = state_in;
   if (current_frame_time <= state_in.last_update_time) {
-    // cout << ANSI_COLOR_RED_BOLD << "Error current_frame_time <=
-    // state_in.last_update_time | " << current_frame_time -
-    // state_in.last_update_time << ANSI_COLOR_RESET << endl;
+    std::cout << ANSI_COLOR_RED_BOLD
+              << "Error current_frame_time <= state_in.last_update_time | "
+              << current_frame_time - state_in.last_update_time
+              << ANSI_COLOR_RESET << std::endl;
     return false;
   }
   mtx_buffer.lock();
@@ -550,6 +559,7 @@ bool R3LIVE::vio_preintegration(StatesGroup &state_in, StatesGroup &state_out,
     }
   }
 
+  // 始终保留当前相机时间戳200ms之内的imu数据，其他都丢弃
   while (!imu_buffer_vio.empty()) {
     double imu_time = imu_buffer_vio.front()->header.stamp.toSec();
     if (imu_time < current_frame_time - 0.2) {
@@ -558,14 +568,24 @@ bool R3LIVE::vio_preintegration(StatesGroup &state_in, StatesGroup &state_out,
       break;
     }
   }
-  // cout << "Current VIO_imu buffer size = " << imu_buffer_vio.size() << endl;
+  cout << "Current VIO_imu buffer size = " << imu_buffer_vio.size() << endl;
+
+  std::cout << "current_frame_time: " << current_frame_time << std::endl;
+  std::cout << "vio_imu_queue timestamp: ";
+  for (auto msg : vio_imu_queue) {
+    std::cout << msg->header.stamp.toSec() << ", ";
+  }
+  std::cout << std::endl;
+
   state_out = m_imu_process->imu_preintegration(
       state_out, vio_imu_queue,
       current_frame_time - vio_imu_queue.back()->header.stamp.toSec());
+
   eigen_q q_diff(state_out.rot_end.transpose() * state_in.rot_end);
-  // cout << "Pos diff = " << (state_out.pos_end - state_in.pos_end).transpose()
-  // << endl; cout << "Euler diff = " <<
-  // q_diff.angularDistance(eigen_q::Identity()) * 57.3 << endl;
+  cout << "Pos diff = " << (state_out.pos_end - state_in.pos_end).transpose()
+       << endl;
+  cout << "Euler diff = " << q_diff.angularDistance(eigen_q::Identity()) * 57.3
+       << endl;
   mtx_buffer.unlock();
   state_out.last_update_time = current_frame_time;
   return true;
@@ -584,7 +604,10 @@ double get_huber_loss_scale(double reprojection_error,
   }
   return scale;
 }
-
+// 用状态预测结果(imu预积分结果)作为这帧图像的初始位姿。
+// 1.判断是否优化外参数和内参数
+// 2.初始化一些临时变量
+// 3.如果当前跟踪的特征点数量少于10个，直接返回false
 // ANCHOR - VIO_esikf
 const int minimum_iteration_pts = 10;
 bool R3LIVE::vio_esikf(StatesGroup &state_in, Rgbmap_tracker &op_track) {
@@ -592,9 +615,8 @@ bool R3LIVE::vio_esikf(StatesGroup &state_in, Rgbmap_tracker &op_track) {
   tim.tic();
   scope_color(ANSI_COLOR_BLUE_BOLD);
   StatesGroup state_iter = state_in;
-  if (!m_if_estimate_intrinsic) // When disable the online intrinsic
-                                // calibration.
-  {
+  // When disable the online intrinsic calibration.
+  if (!m_if_estimate_intrinsic) {
     state_iter.cam_intrinsic << g_cam_K(0, 0), g_cam_K(1, 1), g_cam_K(0, 2),
         g_cam_K(1, 2);
   }
@@ -633,6 +655,9 @@ bool R3LIVE::vio_esikf(StatesGroup &state_in, Rgbmap_tracker &op_track) {
 
   double acc_reprojection_error = 0;
   double img_res_scale = 1.0;
+
+  std::cout << "esikf_iter_times: " << esikf_iter_times << std::endl;
+
   for (int iter_count = 0; iter_count < esikf_iter_times; iter_count++) {
 
     // cout << "========== Iter " << iter_count << " =========" << endl;
@@ -1031,108 +1056,6 @@ void R3LIVE::service_pub_rgb_maps() {
   }
 }
 
-void R3LIVE::publish_render_pts(ros::Publisher &pts_pub,
-                                Global_map &m_map_rgb_pts) {
-  pcl::PointCloud<pcl::PointXYZRGB> pc_rgb;
-  sensor_msgs::PointCloud2 ros_pc_msg;
-  pc_rgb.reserve(1e7);
-  m_map_rgb_pts.m_mutex_m_box_recent_hitted->lock();
-  std::unordered_set<std::shared_ptr<RGB_Voxel>> boxes_recent_hitted =
-      m_map_rgb_pts.m_voxels_recent_visited;
-  m_map_rgb_pts.m_mutex_m_box_recent_hitted->unlock();
-
-  for (Voxel_set_iterator it = boxes_recent_hitted.begin();
-       it != boxes_recent_hitted.end(); it++) {
-    for (int pt_idx = 0; pt_idx < (*it)->m_pts_in_grid.size(); pt_idx++) {
-      pcl::PointXYZRGB pt;
-      std::shared_ptr<RGB_pts> rgb_pt = (*it)->m_pts_in_grid[pt_idx];
-      pt.x = rgb_pt->m_pos[0];
-      pt.y = rgb_pt->m_pos[1];
-      pt.z = rgb_pt->m_pos[2];
-      pt.r = rgb_pt->m_rgb[2];
-      pt.g = rgb_pt->m_rgb[1];
-      pt.b = rgb_pt->m_rgb[0];
-      if (rgb_pt->m_N_rgb > m_pub_pt_minimum_views) {
-        pc_rgb.points.push_back(pt);
-      }
-    }
-  }
-  pcl::toROSMsg(pc_rgb, ros_pc_msg);
-  ros_pc_msg.header.frame_id = "world";       // world; camera_init
-  ros_pc_msg.header.stamp = ros::Time::now(); //.fromSec(last_timestamp_lidar);
-  pts_pub.publish(ros_pc_msg);
-}
-
-void R3LIVE::publish_camera_odom(std::shared_ptr<Image_frame> &image,
-                                 double msg_time) {
-  eigen_q odom_q = image->m_pose_w2c_q;
-  vec_3 odom_t = image->m_pose_w2c_t;
-  nav_msgs::Odometry camera_odom;
-  camera_odom.header.frame_id = "world";
-  camera_odom.child_frame_id = "/aft_mapped";
-  camera_odom.header.stamp =
-      ros::Time::now(); // ros::Time().fromSec(last_timestamp_lidar);
-  camera_odom.pose.pose.orientation.x = odom_q.x();
-  camera_odom.pose.pose.orientation.y = odom_q.y();
-  camera_odom.pose.pose.orientation.z = odom_q.z();
-  camera_odom.pose.pose.orientation.w = odom_q.w();
-  camera_odom.pose.pose.position.x = odom_t(0);
-  camera_odom.pose.pose.position.y = odom_t(1);
-  camera_odom.pose.pose.position.z = odom_t(2);
-  pub_odom_cam.publish(camera_odom);
-
-  geometry_msgs::PoseStamped msg_pose;
-  msg_pose.header.stamp = ros::Time().fromSec(msg_time);
-  msg_pose.header.frame_id = "world";
-  msg_pose.pose.orientation.x = odom_q.x();
-  msg_pose.pose.orientation.y = odom_q.y();
-  msg_pose.pose.orientation.z = odom_q.z();
-  msg_pose.pose.orientation.w = odom_q.w();
-  msg_pose.pose.position.x = odom_t(0);
-  msg_pose.pose.position.y = odom_t(1);
-  msg_pose.pose.position.z = odom_t(2);
-  camera_path.header.frame_id = "world";
-  camera_path.poses.push_back(msg_pose);
-  pub_path_cam.publish(camera_path);
-}
-
-void R3LIVE::publish_track_pts(Rgbmap_tracker &tracker) {
-  pcl::PointXYZRGB temp_point;
-  pcl::PointCloud<pcl::PointXYZRGB> pointcloud_for_pub;
-
-  for (auto it : tracker.m_map_rgb_pts_in_current_frame_pos) {
-    vec_3 pt = ((RGB_pts *)it.first)->get_pos();
-    cv::Scalar color = ((RGB_pts *)it.first)->m_dbg_color;
-    temp_point.x = pt(0);
-    temp_point.y = pt(1);
-    temp_point.z = pt(2);
-    temp_point.r = color(2);
-    temp_point.g = color(1);
-    temp_point.b = color(0);
-    pointcloud_for_pub.points.push_back(temp_point);
-  }
-  sensor_msgs::PointCloud2 ros_pc_msg;
-  pcl::toROSMsg(pointcloud_for_pub, ros_pc_msg);
-  ros_pc_msg.header.stamp = ros::Time::now(); //.fromSec(last_timestamp_lidar);
-  ros_pc_msg.header.frame_id = "world";       // world; camera_init
-  m_pub_visual_tracked_3d_pts.publish(ros_pc_msg);
-}
-
-char R3LIVE::cv_keyboard_callback() {
-  char c = cv_wait_key(1);
-  // return c;
-  if (c == 's' || c == 'S') {
-    scope_color(ANSI_COLOR_GREEN_BOLD);
-    cout << "I capture the keyboard input!!!" << endl;
-    m_mvs_recorder.export_to_mvs(m_map_rgb_pts);
-    // m_map_rgb_pts.save_and_display_pointcloud( m_map_output_dir,
-    // std::string("/rgb_pt"), std::max(m_pub_pt_minimum_views, 5) );
-    m_map_rgb_pts.save_and_display_pointcloud(
-        m_map_output_dir, std::string("/rgb_pt"), m_pub_pt_minimum_views);
-  }
-  return c;
-}
-
 // 1. 调用op_track.set_intrinsic() (Rgbmap_tracker类)
 // 设置内参，畸变参数，图像大小参数
 // 2. 设置m_map_rgb_pts(Global_map类)的最大跟踪点，最大深度，最小深度
@@ -1354,4 +1277,106 @@ void R3LIVE::service_VIO_update() {
     }
     // cout << "Publish cost time " << tim.toc("Pub") << endl;
   }
+}
+
+void R3LIVE::publish_render_pts(ros::Publisher &pts_pub,
+                                Global_map &m_map_rgb_pts) {
+  pcl::PointCloud<pcl::PointXYZRGB> pc_rgb;
+  sensor_msgs::PointCloud2 ros_pc_msg;
+  pc_rgb.reserve(1e7);
+  m_map_rgb_pts.m_mutex_m_box_recent_hitted->lock();
+  std::unordered_set<std::shared_ptr<RGB_Voxel>> boxes_recent_hitted =
+      m_map_rgb_pts.m_voxels_recent_visited;
+  m_map_rgb_pts.m_mutex_m_box_recent_hitted->unlock();
+
+  for (Voxel_set_iterator it = boxes_recent_hitted.begin();
+       it != boxes_recent_hitted.end(); it++) {
+    for (int pt_idx = 0; pt_idx < (*it)->m_pts_in_grid.size(); pt_idx++) {
+      pcl::PointXYZRGB pt;
+      std::shared_ptr<RGB_pts> rgb_pt = (*it)->m_pts_in_grid[pt_idx];
+      pt.x = rgb_pt->m_pos[0];
+      pt.y = rgb_pt->m_pos[1];
+      pt.z = rgb_pt->m_pos[2];
+      pt.r = rgb_pt->m_rgb[2];
+      pt.g = rgb_pt->m_rgb[1];
+      pt.b = rgb_pt->m_rgb[0];
+      if (rgb_pt->m_N_rgb > m_pub_pt_minimum_views) {
+        pc_rgb.points.push_back(pt);
+      }
+    }
+  }
+  pcl::toROSMsg(pc_rgb, ros_pc_msg);
+  ros_pc_msg.header.frame_id = "world";       // world; camera_init
+  ros_pc_msg.header.stamp = ros::Time::now(); //.fromSec(last_timestamp_lidar);
+  pts_pub.publish(ros_pc_msg);
+}
+
+void R3LIVE::publish_camera_odom(std::shared_ptr<Image_frame> &image,
+                                 double msg_time) {
+  eigen_q odom_q = image->m_pose_w2c_q;
+  vec_3 odom_t = image->m_pose_w2c_t;
+  nav_msgs::Odometry camera_odom;
+  camera_odom.header.frame_id = "world";
+  camera_odom.child_frame_id = "/aft_mapped";
+  camera_odom.header.stamp =
+      ros::Time::now(); // ros::Time().fromSec(last_timestamp_lidar);
+  camera_odom.pose.pose.orientation.x = odom_q.x();
+  camera_odom.pose.pose.orientation.y = odom_q.y();
+  camera_odom.pose.pose.orientation.z = odom_q.z();
+  camera_odom.pose.pose.orientation.w = odom_q.w();
+  camera_odom.pose.pose.position.x = odom_t(0);
+  camera_odom.pose.pose.position.y = odom_t(1);
+  camera_odom.pose.pose.position.z = odom_t(2);
+  pub_odom_cam.publish(camera_odom);
+
+  geometry_msgs::PoseStamped msg_pose;
+  msg_pose.header.stamp = ros::Time().fromSec(msg_time);
+  msg_pose.header.frame_id = "world";
+  msg_pose.pose.orientation.x = odom_q.x();
+  msg_pose.pose.orientation.y = odom_q.y();
+  msg_pose.pose.orientation.z = odom_q.z();
+  msg_pose.pose.orientation.w = odom_q.w();
+  msg_pose.pose.position.x = odom_t(0);
+  msg_pose.pose.position.y = odom_t(1);
+  msg_pose.pose.position.z = odom_t(2);
+  camera_path.header.frame_id = "world";
+  camera_path.poses.push_back(msg_pose);
+  pub_path_cam.publish(camera_path);
+}
+
+void R3LIVE::publish_track_pts(Rgbmap_tracker &tracker) {
+  pcl::PointXYZRGB temp_point;
+  pcl::PointCloud<pcl::PointXYZRGB> pointcloud_for_pub;
+
+  for (auto it : tracker.m_map_rgb_pts_in_current_frame_pos) {
+    vec_3 pt = ((RGB_pts *)it.first)->get_pos();
+    cv::Scalar color = ((RGB_pts *)it.first)->m_dbg_color;
+    temp_point.x = pt(0);
+    temp_point.y = pt(1);
+    temp_point.z = pt(2);
+    temp_point.r = color(2);
+    temp_point.g = color(1);
+    temp_point.b = color(0);
+    pointcloud_for_pub.points.push_back(temp_point);
+  }
+  sensor_msgs::PointCloud2 ros_pc_msg;
+  pcl::toROSMsg(pointcloud_for_pub, ros_pc_msg);
+  ros_pc_msg.header.stamp = ros::Time::now(); //.fromSec(last_timestamp_lidar);
+  ros_pc_msg.header.frame_id = "world";       // world; camera_init
+  m_pub_visual_tracked_3d_pts.publish(ros_pc_msg);
+}
+
+char R3LIVE::cv_keyboard_callback() {
+  char c = cv_wait_key(1);
+  // return c;
+  if (c == 's' || c == 'S') {
+    scope_color(ANSI_COLOR_GREEN_BOLD);
+    cout << "I capture the keyboard input!!!" << endl;
+    m_mvs_recorder.export_to_mvs(m_map_rgb_pts);
+    // m_map_rgb_pts.save_and_display_pointcloud( m_map_output_dir,
+    // std::string("/rgb_pt"), std::max(m_pub_pt_minimum_views, 5) );
+    m_map_rgb_pts.save_and_display_pointcloud(
+        m_map_output_dir, std::string("/rgb_pt"), m_pub_pt_minimum_views);
+  }
+  return c;
 }

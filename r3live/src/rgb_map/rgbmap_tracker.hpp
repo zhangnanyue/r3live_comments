@@ -188,6 +188,7 @@ public:
                  int if_use_opencv = 1);
   int get_all_tracked_pts(
       std::vector<std::vector<cv::Point2f>> *img_pt_vec = nullptr);
+
   int remove_outlier_using_ransac_pnp(std::shared_ptr<Image_frame> &img_pose,
                                       int if_remove_ourlier = 1);
 };
