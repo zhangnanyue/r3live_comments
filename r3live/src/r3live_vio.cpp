@@ -791,18 +791,22 @@ bool R3LIVE::vio_esikf(StatesGroup &state_in, Rgbmap_tracker &op_track) {
       break;
     }
 
-    H_mat_spa = H_mat.sparseView();
-    Eigen::SparseMatrix<double> Hsub_T_temp_mat = H_mat_spa.transpose();
-    vec_spa = (state_iter - state_in).sparseView();
-    H_T_H_spa = Hsub_T_temp_mat * H_mat_spa;
+    H_mat_spa = H_mat.sparseView(); // H
+    Eigen::SparseMatrix<double> Hsub_T_temp_mat = H_mat_spa.transpose(); // H^T
+    vec_spa = (state_iter - state_in).sparseView(); // 
+    H_T_H_spa = Hsub_T_temp_mat * H_mat_spa; // H^T * H
     // Notice that we have combine some matrix using () in order to boost the
     // matrix multiplication.
+    //(H^T * H + P^-1)^-1
     Eigen::SparseMatrix<double> temp_inv_mat =
         ((H_T_H_spa.toDense() +
           eigen_mat<-1, -1>(state_in.cov * m_cam_measurement_weight).inverse())
              .inverse())
             .sparseView();
-    KH_spa =   * (Hsub_T_temp_mat * H_mat_spa);
+    //K * H
+    KH_spa = temp_inv_mat * (Hsub_T_temp_mat * H_mat_spa);
+    // (H^T * H + P^-1)^-1 * ( H^T * (-Z) ) - ( I - K * H) * (X_k - X_0)
+    // delta_error_X = X_k+1 - X_k = -K * Z - (I - K * H) * (X_k - X_0)
     solution =
         (temp_inv_mat * (Hsub_T_temp_mat * ((-1 * meas_vec.sparseView()))) -
          (I_STATE_spa - KH_spa) * vec_spa)
@@ -815,6 +819,7 @@ bool R3LIVE::vio_esikf(StatesGroup &state_in, Rgbmap_tracker &op_track) {
     }
     last_repro_err = acc_reprojection_error;
   }
+
 
   if (avail_pt_count >= minimum_iteration_pts) {
     state_iter.cov =
@@ -832,18 +837,17 @@ bool R3LIVE::vio_photometric(StatesGroup &state_in, Rgbmap_tracker &op_track,
   Common_tools::Timer tim;
   tim.tic();
   StatesGroup state_iter = state_in;
-  if (!m_if_estimate_intrinsic) // When disable the online intrinsic
-                                // calibration.
-  {
+  // When disable the online intrinsic calibration.
+  if (!m_if_estimate_intrinsic) {
     state_iter.cam_intrinsic << g_cam_K(0, 0), g_cam_K(1, 1), g_cam_K(0, 2),
         g_cam_K(1, 2);
   }
-  if (!m_if_estimate_i2c_extrinsic) // When disable the online extrinsic
-                                    // calibration.
-  {
+  // When disable the online extrinsic calibration.
+  if (!m_if_estimate_i2c_extrinsic) {
     state_iter.pos_ext_i2c = m_inital_pos_ext_i2c;
     state_iter.rot_ext_i2c = m_inital_rot_ext_i2c;
   }
+
   Eigen::Matrix<double, -1, -1> H_mat, R_mat_inv;
   Eigen::Matrix<double, -1, 1> meas_vec;
   Eigen::Matrix<double, DIM_OF_STATES, DIM_OF_STATES> G, H_T_H, I_STATE;
@@ -930,13 +934,17 @@ bool R3LIVE::vio_photometric(StatesGroup &state_in, Rgbmap_tracker &op_track,
             pt_rgb_info(i, i);
         // R_mat_inv( pt_idx * err_size + i, pt_idx * err_size + i ) =  1.0;
       }
+      // 影像中x、y方向上的rgb差值
       vec_3 obs_rgb_dx, obs_rgb_dy;
+      // 投影点从影像插值获取rgb，计算x、y方向上的rgb差值
       vec_3 obs_rgb = image->get_rgb(pt_img_proj(0), pt_img_proj(1), 0,
                                      &obs_rgb_dx, &obs_rgb_dy);
+      //rgb误差: 图像对应点rgb - 地图点rgb 
       vec_3 photometric_err_vec = (obs_rgb - pt_rgb);
       double huber_loss_scale =
           get_huber_loss_scale(photometric_err_vec.norm());
       photometric_err_vec *= huber_loss_scale;
+      //影像误差 e^T * info_rgb(map) * e
       double photometric_err =
           photometric_err_vec.transpose() * pt_rgb_info * photometric_err_vec;
 
@@ -1015,6 +1023,7 @@ bool R3LIVE::vio_photometric(StatesGroup &state_in, Rgbmap_tracker &op_track,
     }
     last_repro_err = acc_photometric_error;
   }
+  
   if (if_esikf && avail_pt_count >= minimum_iteration_pts) {
     state_iter.cov =
         ((I_STATE_spa - KH_spa) * state_iter.cov.sparseView()).toDense();
