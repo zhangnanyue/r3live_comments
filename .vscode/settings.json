@@ -74,5 +74,15 @@
         "valarray": "cpp",
         "variant": "cpp",
         "*.ipp": "cpp"
-    }
+    },
+    "python.autoComplete.extraPaths": [
+        "/home/caros/catkin_r3live_comments/devel/lib/python3/dist-packages",
+        "/opt/ros/noetic/lib/python3/dist-packages",
+        "/home/caros/neolix_orin/opt/python"
+    ],
+    "python.analysis.extraPaths": [
+        "/home/caros/catkin_r3live_comments/devel/lib/python3/dist-packages",
+        "/opt/ros/noetic/lib/python3/dist-packages",
+        "/home/caros/neolix_orin/opt/python"
+    ]
 }

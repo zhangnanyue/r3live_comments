@@ -291,13 +291,13 @@ ImuProcess::imu_preintegration(const StatesGroup &state_in,
     angvel_last = angvel_avr;
     acc_s_last = acc_imu;
 
-    cout << std::setprecision(3) << " dt = " << dt
-         << ", acc: " << acc_avr.transpose()
-         << " acc_imu: " << acc_imu.transpose()
-         << " vel_imu: " << vel_imu.transpose()
-         << " ang_vel: " << angvel_avr.transpose()
-         << " pos_imu: " << pos_imu.transpose() << endl;
-    cout << "Acc_avr: " << acc_avr.transpose() << endl;
+    // cout << std::setprecision(3) << "dt: " << dt
+    //      << ", acc: " << acc_avr.transpose()
+    //      << ", acc_imu: " << acc_imu.transpose()
+    //      << ", vel_imu: " << vel_imu.transpose()
+    //      << ", ang_vel: " << angvel_avr.transpose()
+    //      << ", pos_imu: " << pos_imu.transpose()
+    //      << ", Acc_avr: " << acc_avr.transpose() << endl;
   }
 
   // cout <<__FILE__ << ", " << __LINE__ <<" ,diagnose lio_state = " <<

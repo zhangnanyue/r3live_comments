@@ -526,10 +526,11 @@ void R3LIVE::set_image_pose(std::shared_ptr<Image_frame> &image_pose,
   image_pose->m_cam_K << image_pose->fx, 0, image_pose->cx, 0, image_pose->fy,
       image_pose->cy, 0, 0, 1;
   scope_color(ANSI_COLOR_CYAN_BOLD);
-  cout << "Set Image Pose frm [" << image_pose->m_frame_idx
-       << "], pose: " << eigen_q(rot_mat).coeffs().transpose() << " | "
-       << t_vec.transpose() << " | "
-       << eigen_q(rot_mat).angularDistance(eigen_q::Identity()) * 57.3 << endl;
+  // cout << "Set Image Pose frm [" << image_pose->m_frame_idx
+  //      << "], pose: " << eigen_q(rot_mat).coeffs().transpose() << " | "
+  //      << t_vec.transpose() << " | "
+  //      << eigen_q(rot_mat).angularDistance(eigen_q::Identity()) * 57.3 <<
+  //      endl;
   image_pose->inverse_pose();
 }
 // 0. 入参包括：lidar状态(StatesGroup类)，
@@ -568,11 +569,15 @@ bool R3LIVE::vio_preintegration(StatesGroup &state_in, StatesGroup &state_out,
       break;
     }
   }
-  cout << "Current VIO_imu buffer size = " << imu_buffer_vio.size() << endl;
+  std::cout << std::endl
+            << "Current VIO_imu buffer size = " << imu_buffer_vio.size()
+            << endl;
 
+  std::cout.precision(15);
   std::cout << "current_frame_time: " << current_frame_time << std::endl;
   std::cout << "vio_imu_queue timestamp: ";
   for (auto msg : vio_imu_queue) {
+    std::cout.precision(15);
     std::cout << msg->header.stamp.toSec() << ", ";
   }
   std::cout << std::endl;
@@ -604,6 +609,7 @@ double get_huber_loss_scale(double reprojection_error,
   }
   return scale;
 }
+
 // 用状态预测结果(imu预积分结果)作为这帧图像的初始位姿。
 // 1.判断是否优化外参数和内参数
 // 2.初始化一些临时变量
@@ -657,12 +663,14 @@ bool R3LIVE::vio_esikf(StatesGroup &state_in, Rgbmap_tracker &op_track) {
   double img_res_scale = 1.0;
 
   std::cout << "esikf_iter_times: " << esikf_iter_times << std::endl;
-
+  std::cout << "state_iter.pos_end: " << state_iter.pos_end.transpose()
+            << std::endl;
   for (int iter_count = 0; iter_count < esikf_iter_times; iter_count++) {
 
     // cout << "========== Iter " << iter_count << " =========" << endl;
     mat_3_3 R_imu = state_iter.rot_end;
     vec_3 t_imu = state_iter.pos_end;
+
     vec_3 t_c2w = R_imu * state_iter.pos_ext_i2c + t_imu;
     mat_3_3 R_c2w = R_imu * state_iter.rot_ext_i2c; // world to camera frame
 
@@ -684,16 +692,26 @@ bool R3LIVE::vio_esikf(StatesGroup &state_in, Rgbmap_tracker &op_track) {
     solution.setZero();
     meas_vec.setZero();
     avail_pt_count = 0;
+
+    // 获取每个点的H stack矩阵
     for (auto it = op_track.m_map_rgb_pts_in_last_frame_pos.begin();
          it != op_track.m_map_rgb_pts_in_last_frame_pos.end(); it++) {
+      // 获取地图点的3d坐标
       pt_3d_w = ((RGB_pts *)it->first)->get_pos();
+      // 获取跟踪像素点的速度
       pt_img_vel = ((RGB_pts *)it->first)->m_img_vel;
+      // 像素点坐标
       pt_img_measure = vec_2(it->second.x, it->second.y);
+      // 根据（预积分算出来的位姿？），将地图点转到相机坐标下的点
       pt_3d_cam = R_w2c * pt_3d_w + t_w2c;
+      // 考虑靠timeoffset，将上述相机坐标系下的3d点转成像素坐标系
+      // 对应公式(5)
       pt_img_proj = vec_2(fx * pt_3d_cam(0) / pt_3d_cam(2) + cx,
                           fy * pt_3d_cam(1) / pt_3d_cam(2) + cy) +
                     time_td * pt_img_vel;
+      // 计算重投影误差，这里计算的是误差的大小，不用于迭代求解，只是用来确定huber核函数
       double repro_err = (pt_img_proj - pt_img_measure).norm();
+      // 套一层huber核
       double huber_loss_scale = get_huber_loss_scale(repro_err);
       pt_idx++;
       acc_reprojection_error += repro_err;
@@ -707,38 +725,64 @@ bool R3LIVE::vio_esikf(StatesGroup &state_in, Rgbmap_tracker &op_track) {
       avail_pt_count++;
       // Appendix E of r2live_Supplementary_material.
       // https://github.com/hku-mars/r2live/blob/master/supply/r2live_Supplementary_material.pdf
-      mat_pre << fx / pt_3d_cam(2), 0, -fx * pt_3d_cam(0) / pt_3d_cam(2), 0,
-          fy / pt_3d_cam(2), -fy * pt_3d_cam(1) / pt_3d_cam(2);
 
+      // 投影模型，对相机坐标系求导数
+      // TODO:投影模型错误
+      // mat_pre << fx / pt_3d_cam(2), 0, -fx * pt_3d_cam(0) / pt_3d_cam(2), 0,
+      //     fy / pt_3d_cam(2), -fy * pt_3d_cam(1) / pt_3d_cam(2);
+      // mat_pre << fx / pt_3d_cam(2), 0,
+      //     -fx * pt_3d_cam(0) / (pt_3d_cam(2) * pt_3d_cam(2)), 0,
+      //     fy / pt_3d_cam(2), -fy * pt_3d_cam(1) / (pt_3d_cam(2) *
+      //     pt_3d_cam(2));
+      // imu坐标系下的地图点p(IMU)^ = R(IMU <-- W) * ( p(W) - p(IMU) )
       pt_hat = Sophus::SO3d::hat((R_imu.transpose() * (pt_3d_w - t_imu)));
+
+      // 3 * 3, 对error_R_G_I求导, R_camera_imu * p(imu)^
       mat_A = state_iter.rot_ext_i2c.transpose() * pt_hat;
+
+      // 3 * 3, 对error_p_G_I求导, -R_camera_imu * R_I_G
       mat_B = -state_iter.rot_ext_i2c.transpose() * (R_imu.transpose());
+
+      // 3 * 3, 对error_R_imu_camera求导,  p(C)^
       mat_C = Sophus::SO3d::hat(pt_3d_cam);
+
+      // 3 * 3, 对error_p_imu_camera求导,  -R_camera_imu
       mat_D = -state_iter.rot_ext_i2c.transpose();
+
+      //观测向量填充
       meas_vec.block(pt_idx * 2, 0, 2, 1) =
           (pt_img_proj - pt_img_measure) * huber_loss_scale / img_res_scale;
-
+      // H, 1-2行，前3列, 对R(IMU)雅可比
       H_mat.block(pt_idx * 2, 0, 2, 3) = mat_pre * mat_A * huber_loss_scale;
+      // H, 1-2行，4-6列，对P(IMU)雅可比
       H_mat.block(pt_idx * 2, 3, 2, 3) = mat_pre * mat_B * huber_loss_scale;
       if (DIM_OF_STATES > 24) {
         // Estimate time td.
+        // H，1-2行， 25-26列，对时间误差求雅可比
         H_mat.block(pt_idx * 2, 24, 2, 1) = pt_img_vel * huber_loss_scale;
         // H_mat(pt_idx * 2, 24) = pt_img_vel(0) * huber_loss_scale;
         // H_mat(pt_idx * 2 + 1, 24) = pt_img_vel(1) * huber_loss_scale;
       }
       if (m_if_estimate_i2c_extrinsic) {
+        // H ,1-2行，19-21列，对外参R(IMU<--C)雅可比
         H_mat.block(pt_idx * 2, 18, 2, 3) = mat_pre * mat_C * huber_loss_scale;
+        // H ,1-2行，22-24列，对外参t(IMU<--C)雅可比
         H_mat.block(pt_idx * 2, 21, 2, 3) = mat_pre * mat_D * huber_loss_scale;
       }
 
       if (m_if_estimate_intrinsic) {
+        // H,1行，26列，对内参fx雅可比
         H_mat(pt_idx * 2, 25) = pt_3d_cam(0) / pt_3d_cam(2) * huber_loss_scale;
+        // H,2行，27列，对内参fy雅可比
         H_mat(pt_idx * 2 + 1, 26) =
             pt_3d_cam(1) / pt_3d_cam(2) * huber_loss_scale;
+        // H,1行，28列，对内参cx雅可比
         H_mat(pt_idx * 2, 27) = 1 * huber_loss_scale;
+        // H,2行，29列，对内参cy雅可比
         H_mat(pt_idx * 2 + 1, 28) = 1 * huber_loss_scale;
       }
     }
+
     H_mat = H_mat / img_res_scale;
     acc_reprojection_error /= total_pt_size;
 
@@ -758,7 +802,7 @@ bool R3LIVE::vio_esikf(StatesGroup &state_in, Rgbmap_tracker &op_track) {
           eigen_mat<-1, -1>(state_in.cov * m_cam_measurement_weight).inverse())
              .inverse())
             .sparseView();
-    KH_spa = temp_inv_mat * (Hsub_T_temp_mat * H_mat_spa);
+    KH_spa =   * (Hsub_T_temp_mat * H_mat_spa);
     solution =
         (temp_inv_mat * (Hsub_T_temp_mat * ((-1 * meas_vec.sparseView()))) -
          (I_STATE_spa - KH_spa) * vec_spa)
@@ -1186,11 +1230,17 @@ void R3LIVE::service_VIO_update() {
     }
     set_image_pose(img_pose, state_out);
 
+    std::cout << "vio_preintegration, state_out.pos_end: "
+              << state_out.pos_end.transpose() << std::endl;
+
     op_track.track_img(img_pose, -20);
     g_cost_time_logger.record(tim, "Track_img");
     // cout << "Track_img cost " << tim.toc( "Track_img" ) << endl;
     tim.tic("Ransac");
     set_image_pose(img_pose, state_out);
+
+    std::cout << "track_img, state_out.pos_end: "
+              << state_out.pos_end.transpose() << std::endl;
 
     // ANCHOR -  remove point using PnP.
     if (op_track.remove_outlier_using_ransac_pnp(img_pose) == 0) {
@@ -1198,6 +1248,9 @@ void R3LIVE::service_VIO_update() {
                 << "****** Remove_outlier_using_ransac_pnp error*****"
                 << ANSI_COLOR_RESET << std::endl;
     }
+    std::cout << "ransac_pnp, state_out.pos_end: "
+              << state_out.pos_end.transpose() << std::endl;
+
     g_cost_time_logger.record(tim, "Ransac");
     tim.tic("Vio_f2f");
     bool res_esikf = true, res_photometric = true;
