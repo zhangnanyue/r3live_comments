@@ -161,7 +161,9 @@ bool Image_frame::if_2d_points_available(const double &u, const double &v,
     return false;
   }
 }
-
+// 1.像素坐标向下取整floor和向上取整ceil，并获取插值部分frac_row，frac_col
+// 2.判断是否有多层金字塔，如果有，则需要对floor和ceil进行偏移2,4,6.......
+// 3.根据插值公式进行双线性插值
 template <typename T>
 inline T getSubPixel(cv::Mat &mat, const double &row, const double &col,
                      double pyramid_layer = 0) {
@@ -171,6 +173,7 @@ inline T getSubPixel(cv::Mat &mat, const double &row, const double &col,
   double frac_col = col - floor_col;
   int ceil_row = floor_row + 1;
   int ceil_col = floor_col + 1;
+
   if (pyramid_layer != 0) {
     int pos_bias = pow(2, pyramid_layer - 1);
     floor_row -= pos_bias;
@@ -178,6 +181,7 @@ inline T getSubPixel(cv::Mat &mat, const double &row, const double &col,
     ceil_row += pos_bias;
     ceil_row += pos_bias;
   }
+  // 双线性插值
   return ((1.0 - frac_row) * (1.0 - frac_col) *
           (T)mat.ptr<T>(floor_row)[floor_col]) +
          (frac_row * (1.0 - frac_col) * (T)mat.ptr<T>(ceil_row)[floor_col]) +
@@ -185,10 +189,18 @@ inline T getSubPixel(cv::Mat &mat, const double &row, const double &col,
          (frac_row * frac_col * (T)mat.ptr<T>(ceil_row)[ceil_col]);
 }
 
+// TODO: 1.这里的梯度为什么要用和
+// 1.调用getSubPixel()获取插值后的像素点的rgb值
+// 2.计算X方向的梯度
+// 3.计算该点左边像素点的rgb值的和rgb_left，该点边像素点的rgb值的和rgb_right，及两边偏移量的和pixel_dif
+// 4.计算X发向的梯度，(rgb_right-rgb_left)/pixel_dif
+// 5.同理计算Y方向的梯度
 vec_3 Image_frame::get_rgb(double &u, double v, int layer, vec_3 *rgb_dx,
                            vec_3 *rgb_dy) {
+  // 定义一个常量 ssd，其值为5，表示在计算梯度时沿着水平或垂直方向的偏移量范围。
   const int ssd = 5;
   cv::Vec3b rgb = getSubPixel<cv::Vec3b>(m_img, v, u, layer);
+  // 计算x轴方向的梯度
   if (rgb_dx != nullptr) {
     cv::Vec3f rgb_left(0, 0, 0), rgb_right(0, 0, 0);
     float pixel_dif = 0;
@@ -200,6 +212,8 @@ vec_3 Image_frame::get_rgb(double &u, double v, int layer, vec_3 *rgb_dx,
     cv::Vec3f cv_rgb_dx = rgb_right - rgb_left;
     *rgb_dx = vec_3(cv_rgb_dx(0), cv_rgb_dx(1), cv_rgb_dx(2)) / pixel_dif;
   }
+
+  // 计算y轴方向的梯度
   if (rgb_dy != nullptr) {
     cv::Vec3f rgb_down(0, 0, 0), rgb_up(0, 0, 0);
     float pixel_dif = 0;

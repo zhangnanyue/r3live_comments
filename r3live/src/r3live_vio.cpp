@@ -597,6 +597,7 @@ bool R3LIVE::vio_preintegration(StatesGroup &state_in, StatesGroup &state_out,
 }
 
 // ANCHOR - huber_loss
+// TODO：huber_loss为什么这么设计？
 double get_huber_loss_scale(double reprojection_error,
                             double outlier_threshold = 1.0) {
   // http://ceres-solver.org/nnls_modeling.html#lossfunction
@@ -610,10 +611,32 @@ double get_huber_loss_scale(double reprojection_error,
   return scale;
 }
 
-// 用状态预测结果(imu预积分结果)作为这帧图像的初始位姿。
+// 用状态预测结果(imu预积分结果)作为这帧图像的初始位姿？
 // 1.判断是否优化外参数和内参数
-// 2.初始化一些临时变量
-// 3.如果当前跟踪的特征点数量少于10个，直接返回false
+// 2.初始化临时变量H_mat、meas_vec、I_STATE、solution、KH及他们的稀疏矩阵
+// 3.计算当前跟踪点数量，如果当前跟踪的特征点数量少于10个，直接返回false
+// 4.初始化last_reprojection_error_vec和current_reprojection_error_vec
+// 5.初始化H_mat和meas_vec及其他的一些变量
+// 6.进行迭代卡尔曼滤波，迭代数次为2
+//    6.1.获取相机内参、世界到相机的外参数、时间误差
+//    6.2.声明临时变量，并在每次迭代开始初始化H_mat、solution、meas_vec、avail_pt_count、acc_reprojection_error为0
+//    6.3 遍历跟踪到的特征点，构造stack H矩阵
+//      6.3.1.获取跟踪像素点的速度、光流跟踪下的像素点2d坐标
+//      6.3.2.获取地图点的3d坐标，通过外参数计算图像投影点2d坐标
+//      6.3.3.计算获得重投影误差(外参数计算图像投影点2d坐标 -
+//      光流跟踪下的像素点2d坐标)
+//      6.3.4.调用get_huber_loss_scale()函数，对重投影误差进行Huber Loss
+//      6.3.5.计算针孔模型投影对相机坐标下的点的导数
+//      6.3.6.计算外参数转化得到的相机坐标下的点对theta_r的求导(error_r、error_p、error_r_i_c、error_p_i_c)
+//      6.3.7.填充H矩阵
+//    6.4.根据scale再次计算H矩阵，计算平均重投影误差acc_reprojection_error，并赋值给last_avr_repro_err
+//    6.5.根据scale再次计算H矩阵，计算平均重投影误差acc_reprojection_error，并赋值给last_avr_repro_err
+//    6.6.再次判断跟踪的特征点数量avail_pt_count是否小于minimum_iteration_pts，如果小于直接推出迭代
+//    6.7.计算卡尔曼增益，并更新状态量
+//    6.8.如果当前重投影误差与上一次重投影误差的差值小于0.01，直接推出迭代,否则赋值，继续迭代
+// 7.计算协方差矩阵P
+// 8.更新状态量中的时间同步误差
+
 // ANCHOR - VIO_esikf
 const int minimum_iteration_pts = 10;
 bool R3LIVE::vio_esikf(StatesGroup &state_in, Rgbmap_tracker &op_track) {
@@ -632,14 +655,25 @@ bool R3LIVE::vio_esikf(StatesGroup &state_in, Rgbmap_tracker &op_track) {
     state_iter.rot_ext_i2c = m_inital_rot_ext_i2c;
   }
 
+  // H矩阵
   Eigen::Matrix<double, -1, -1> H_mat;
+  // 残差矩阵
   Eigen::Matrix<double, -1, 1> meas_vec;
-  Eigen::Matrix<double, DIM_OF_STATES, DIM_OF_STATES> G, H_T_H, I_STATE;
+  // 单位矩阵
+  Eigen::Matrix<double, DIM_OF_STATES, DIM_OF_STATES> I_STATE;
+  // 迭代过程中的状态量
   Eigen::Matrix<double, DIM_OF_STATES, 1> solution;
-  Eigen::Matrix<double, -1, -1> K, KH;
-  Eigen::Matrix<double, DIM_OF_STATES, DIM_OF_STATES> K_1;
+  // K * H矩阵
+  Eigen::Matrix<double, -1, -1> KH;
 
-  Eigen::SparseMatrix<double> H_mat_spa, H_T_H_spa, K_spa, KH_spa, vec_spa,
+  // Eigen::Matrix<double, DIM_OF_STATES, DIM_OF_STATES> G, H_T_H, I_STATE;
+  // Eigen::Matrix<double, -1, -1> K, KH;
+  // Eigen::Matrix<double, DIM_OF_STATES, DIM_OF_STATES> K_1;
+
+  // Eigen::SparseMatrix<double> H_mat_spa, H_T_H_spa, K_spa, KH_spa, vec_spa,
+
+  // 稀疏矩阵
+  Eigen::SparseMatrix<double> H_mat_spa, H_T_H_spa, KH_spa, vec_spa,
       I_STATE_spa;
   I_STATE.setIdentity();
   I_STATE_spa = I_STATE.sparseView();
@@ -653,13 +687,14 @@ bool R3LIVE::vio_esikf(StatesGroup &state_in, Rgbmap_tracker &op_track) {
     state_in = state_iter;
     return false;
   }
+
   H_mat.resize(total_pt_size * 2, DIM_OF_STATES);
   meas_vec.resize(total_pt_size * 2, 1);
   double last_repro_err = 3e8;
   int avail_pt_count = 0;
   double last_avr_repro_err = 0;
-
   double acc_reprojection_error = 0;
+  // TODO: 为什么要设置这个
   double img_res_scale = 1.0;
 
   std::cout << "esikf_iter_times: " << esikf_iter_times << std::endl;
@@ -672,7 +707,10 @@ bool R3LIVE::vio_esikf(StatesGroup &state_in, Rgbmap_tracker &op_track) {
     vec_3 t_imu = state_iter.pos_end;
 
     vec_3 t_c2w = R_imu * state_iter.pos_ext_i2c + t_imu;
-    mat_3_3 R_c2w = R_imu * state_iter.rot_ext_i2c; // world to camera frame
+    mat_3_3 R_c2w = R_imu * state_iter.rot_ext_i2c;
+
+    vec_3 t_w2c = -R_c2w.transpose() * t_c2w;
+    mat_3_3 R_w2c = R_c2w.transpose();
 
     fx = state_iter.cam_intrinsic(0);
     fy = state_iter.cam_intrinsic(1);
@@ -680,10 +718,7 @@ bool R3LIVE::vio_esikf(StatesGroup &state_in, Rgbmap_tracker &op_track) {
     cy = state_iter.cam_intrinsic(3);
     time_td = state_iter.td_ext_i2c_delta;
 
-    vec_3 t_w2c = -R_c2w.transpose() * t_c2w;
-    mat_3_3 R_w2c = R_c2w.transpose();
     int pt_idx = -1;
-    acc_reprojection_error = 0;
     vec_3 pt_3d_w, pt_3d_cam;
     vec_2 pt_img_measure, pt_img_proj, pt_img_vel;
     eigen_mat_d<2, 3> mat_pre;
@@ -692,16 +727,17 @@ bool R3LIVE::vio_esikf(StatesGroup &state_in, Rgbmap_tracker &op_track) {
     solution.setZero();
     meas_vec.setZero();
     avail_pt_count = 0;
+    acc_reprojection_error = 0;
 
-    // 获取每个点的H stack矩阵
+    // 遍历跟踪到的特征点，构造stack H矩阵
     for (auto it = op_track.m_map_rgb_pts_in_last_frame_pos.begin();
          it != op_track.m_map_rgb_pts_in_last_frame_pos.end(); it++) {
-      // 获取地图点的3d坐标
-      pt_3d_w = ((RGB_pts *)it->first)->get_pos();
       // 获取跟踪像素点的速度
       pt_img_vel = ((RGB_pts *)it->first)->m_img_vel;
       // 像素点坐标
       pt_img_measure = vec_2(it->second.x, it->second.y);
+      // 获取地图点的3d坐标
+      pt_3d_w = ((RGB_pts *)it->first)->get_pos();
       // 根据（预积分算出来的位姿？），将地图点转到相机坐标下的点
       pt_3d_cam = R_w2c * pt_3d_w + t_w2c;
       // 考虑靠timeoffset，将上述相机坐标系下的3d点转成像素坐标系
@@ -712,9 +748,11 @@ bool R3LIVE::vio_esikf(StatesGroup &state_in, Rgbmap_tracker &op_track) {
       // 计算重投影误差，这里计算的是误差的大小，不用于迭代求解，只是用来确定huber核函数
       double repro_err = (pt_img_proj - pt_img_measure).norm();
       // 套一层huber核
+      // TODO: 如何使用
       double huber_loss_scale = get_huber_loss_scale(repro_err);
       pt_idx++;
       acc_reprojection_error += repro_err;
+
       // if (iter_count == 0 || ((repro_err -
       // last_reprojection_error_vec[pt_idx]) < 1.5))
       if (iter_count == 0 || ((repro_err - last_avr_repro_err * 5.0) < 0)) {
@@ -730,28 +768,25 @@ bool R3LIVE::vio_esikf(StatesGroup &state_in, Rgbmap_tracker &op_track) {
       // TODO:投影模型错误
       // mat_pre << fx / pt_3d_cam(2), 0, -fx * pt_3d_cam(0) / pt_3d_cam(2), 0,
       //     fy / pt_3d_cam(2), -fy * pt_3d_cam(1) / pt_3d_cam(2);
-      // mat_pre << fx / pt_3d_cam(2), 0,
-      //     -fx * pt_3d_cam(0) / (pt_3d_cam(2) * pt_3d_cam(2)), 0,
-      //     fy / pt_3d_cam(2), -fy * pt_3d_cam(1) / (pt_3d_cam(2) *
-      //     pt_3d_cam(2));
-      // imu坐标系下的地图点p(IMU)^ = R(IMU <-- W) * ( p(W) - p(IMU) )
-      pt_hat = Sophus::SO3d::hat((R_imu.transpose() * (pt_3d_w - t_imu)));
+      mat_pre << fx / pt_3d_cam(2), 0,
+          -fx * pt_3d_cam(0) / (pt_3d_cam(2) * pt_3d_cam(2)), 0,
+          fy / pt_3d_cam(2), -fy * pt_3d_cam(1) / (pt_3d_cam(2) * pt_3d_cam(2));
 
+      // imu坐标系下的地图点p(IMU)^ = R_I_W * ( p(W) - p(IMU) )
+      pt_hat = Sophus::SO3d::hat((R_imu.transpose() * (pt_3d_w - t_imu)));
       // 3 * 3, 对error_R_G_I求导, R_camera_imu * p(imu)^
       mat_A = state_iter.rot_ext_i2c.transpose() * pt_hat;
-
       // 3 * 3, 对error_p_G_I求导, -R_camera_imu * R_I_G
       mat_B = -state_iter.rot_ext_i2c.transpose() * (R_imu.transpose());
-
       // 3 * 3, 对error_R_imu_camera求导,  p(C)^
       mat_C = Sophus::SO3d::hat(pt_3d_cam);
-
       // 3 * 3, 对error_p_imu_camera求导,  -R_camera_imu
       mat_D = -state_iter.rot_ext_i2c.transpose();
 
-      //观测向量填充
+      // 残差向量填充
       meas_vec.block(pt_idx * 2, 0, 2, 1) =
           (pt_img_proj - pt_img_measure) * huber_loss_scale / img_res_scale;
+      //构造H矩阵
       // H, 1-2行，前3列, 对R(IMU)雅可比
       H_mat.block(pt_idx * 2, 0, 2, 3) = mat_pre * mat_A * huber_loss_scale;
       // H, 1-2行，4-6列，对P(IMU)雅可比
@@ -782,18 +817,20 @@ bool R3LIVE::vio_esikf(StatesGroup &state_in, Rgbmap_tracker &op_track) {
         H_mat(pt_idx * 2 + 1, 28) = 1 * huber_loss_scale;
       }
     }
+    // 循环结束
 
     H_mat = H_mat / img_res_scale;
     acc_reprojection_error /= total_pt_size;
 
     last_avr_repro_err = acc_reprojection_error;
+
     if (avail_pt_count < minimum_iteration_pts) {
       break;
     }
 
-    H_mat_spa = H_mat.sparseView(); // H
+    H_mat_spa = H_mat.sparseView();                                      // H
     Eigen::SparseMatrix<double> Hsub_T_temp_mat = H_mat_spa.transpose(); // H^T
-    vec_spa = (state_iter - state_in).sparseView(); // 
+    vec_spa = (state_iter - state_in).sparseView();                      //
     H_T_H_spa = Hsub_T_temp_mat * H_mat_spa; // H^T * H
     // Notice that we have combine some matrix using () in order to boost the
     // matrix multiplication.
@@ -803,10 +840,9 @@ bool R3LIVE::vio_esikf(StatesGroup &state_in, Rgbmap_tracker &op_track) {
           eigen_mat<-1, -1>(state_in.cov * m_cam_measurement_weight).inverse())
              .inverse())
             .sparseView();
-    //K * H
+    // K * H
     KH_spa = temp_inv_mat * (Hsub_T_temp_mat * H_mat_spa);
     // (H^T * H + P^-1)^-1 * ( H^T * (-Z) ) - ( I - K * H) * (X_k - X_0)
-    // delta_error_X = X_k+1 - X_k = -K * Z - (I - K * H) * (X_k - X_0)
     solution =
         (temp_inv_mat * (Hsub_T_temp_mat * ((-1 * meas_vec.sparseView()))) -
          (I_STATE_spa - KH_spa) * vec_spa)
@@ -819,7 +855,7 @@ bool R3LIVE::vio_esikf(StatesGroup &state_in, Rgbmap_tracker &op_track) {
     }
     last_repro_err = acc_reprojection_error;
   }
-
+  // 卡尔曼迭代结束
 
   if (avail_pt_count >= minimum_iteration_pts) {
     state_iter.cov =
@@ -831,6 +867,22 @@ bool R3LIVE::vio_esikf(StatesGroup &state_in, Rgbmap_tracker &op_track) {
   state_in = state_iter;
   return true;
 }
+
+// 1.判断是否优化外参数和内参数
+// 2.初始化临时变量H_mat、R_mat_inv、meas_vec、I_STATE、solution、KH及他们的稀疏矩阵
+// 3.计算当前跟踪点数量，如果当前跟踪的特征点数量少于10个，直接返回false
+// 4.初始化last_reprojection_error_vec和current_reprojection_error_vec
+// 5.初始化H_mat、meas_vec、R_mat_inv及其他的一些变量
+// 6.进行迭代卡尔曼滤波，迭代数次为2
+//    6.1.获取相机内参、世界到相机的外参数、时间误差
+//    6.2.声明临时变量，并在每次迭代开始初始化H_mat、R_mat_inv、solution、meas_vec、avail_pt_count、acc_reprojection_error为0
+//    6.3 遍历跟踪到的特征点，构造stack H矩阵
+//      6.3.1.获取跟踪像素点的速度、光流跟踪下的像素点2d坐标
+//      6.3.2.获取地图点的3d坐标，通过外参数计算图像投影点2d坐标
+//      6.3.3.获取地图点rgb及它的协方差矩阵和信息矩阵，在计算噪声矩阵R
+//      6.3.4.通过双线性插值获取该点的rgb值，同时获取该点x、y方向上的rgb的梯度
+//      6.3.5 调用get_rgb()(Image_frame类)构造rgb误差: 图像对应点rgb - 地图点rgb
+// 7.以下步骤可以参考vio_esikf，有几点不同：残差为3维的rgb，构造的H矩阵不再继续对内参数、时间求导，在求解卡尔曼增益K时，加入了测量噪声R
 
 bool R3LIVE::vio_photometric(StatesGroup &state_in, Rgbmap_tracker &op_track,
                              std::shared_ptr<Image_frame> &image) {
@@ -850,10 +902,12 @@ bool R3LIVE::vio_photometric(StatesGroup &state_in, Rgbmap_tracker &op_track,
 
   Eigen::Matrix<double, -1, -1> H_mat, R_mat_inv;
   Eigen::Matrix<double, -1, 1> meas_vec;
-  Eigen::Matrix<double, DIM_OF_STATES, DIM_OF_STATES> G, H_T_H, I_STATE;
+  // Eigen::Matrix<double, DIM_OF_STATES, DIM_OF_STATES> G, H_T_H, I_STATE;
+  Eigen::Matrix<double, DIM_OF_STATES, DIM_OF_STATES> I_STATE;
   Eigen::Matrix<double, DIM_OF_STATES, 1> solution;
-  Eigen::Matrix<double, -1, -1> K, KH;
-  Eigen::Matrix<double, DIM_OF_STATES, DIM_OF_STATES> K_1;
+  // Eigen::Matrix<double, -1, -1> K, KH;
+  Eigen::Matrix<double, -1, -1> KH;
+  // Eigen::Matrix<double, DIM_OF_STATES, DIM_OF_STATES> K_1;
   Eigen::SparseMatrix<double> H_mat_spa, H_T_H_spa, R_mat_inv_spa, K_spa,
       KH_spa, vec_spa, I_STATE_spa;
   I_STATE.setIdentity();
@@ -877,8 +931,8 @@ bool R3LIVE::vio_photometric(StatesGroup &state_in, Rgbmap_tracker &op_track,
   int avail_pt_count = 0;
   double last_avr_repro_err = 0;
   int if_esikf = 1;
-
   double acc_photometric_error = 0;
+
 #if DEBUG_PHOTOMETRIC
   printf("==== [Image frame %d] ====\r\n", g_camera_frame_idx);
 #endif
@@ -888,16 +942,18 @@ bool R3LIVE::vio_photometric(StatesGroup &state_in, Rgbmap_tracker &op_track,
     vec_3 t_c2w = R_imu * state_iter.pos_ext_i2c + t_imu;
     mat_3_3 R_c2w = R_imu * state_iter.rot_ext_i2c; // world to camera frame
 
+    vec_3 t_w2c = -R_c2w.transpose() * t_c2w;
+    mat_3_3 R_w2c = R_c2w.transpose();
+
     fx = state_iter.cam_intrinsic(0);
     fy = state_iter.cam_intrinsic(1);
     cx = state_iter.cam_intrinsic(2);
     cy = state_iter.cam_intrinsic(3);
     time_td = state_iter.td_ext_i2c_delta;
 
-    vec_3 t_w2c = -R_c2w.transpose() * t_c2w;
-    mat_3_3 R_w2c = R_c2w.transpose();
     int pt_idx = -1;
     acc_photometric_error = 0;
+
     vec_3 pt_3d_w, pt_3d_cam;
     vec_2 pt_img_measure, pt_img_proj, pt_img_vel;
     eigen_mat_d<2, 3> mat_pre;
@@ -917,46 +973,54 @@ bool R3LIVE::vio_photometric(StatesGroup &state_in, Rgbmap_tracker &op_track,
         continue;
       }
       pt_idx++;
-      pt_3d_w = ((RGB_pts *)it->first)->get_pos();
       pt_img_vel = ((RGB_pts *)it->first)->m_img_vel;
       pt_img_measure = vec_2(it->second.x, it->second.y);
+      pt_3d_w = ((RGB_pts *)it->first)->get_pos();
       pt_3d_cam = R_w2c * pt_3d_w + t_w2c;
       pt_img_proj = vec_2(fx * pt_3d_cam(0) / pt_3d_cam(2) + cx,
                           fy * pt_3d_cam(1) / pt_3d_cam(2) + cy) +
                     time_td * pt_img_vel;
-
+      // 地图点的rgb信息
       vec_3 pt_rgb = ((RGB_pts *)it->first)->get_rgb();
+      // rgb的信息矩阵
       mat_3_3 pt_rgb_info = mat_3_3::Zero();
+      // rgb的协方差矩阵
       mat_3_3 pt_rgb_cov = ((RGB_pts *)it->first)->get_rgb_cov();
+      // 计算R矩阵
       for (int i = 0; i < 3; i++) {
         pt_rgb_info(i, i) = 1.0 / pt_rgb_cov(i, i);
+        //斜对角块 R_i = 1 / (cov_pt_i_cov)
+        // TODO:未能理解？
         R_mat_inv(pt_idx * err_size + i, pt_idx * err_size + i) =
             pt_rgb_info(i, i);
         // R_mat_inv( pt_idx * err_size + i, pt_idx * err_size + i ) =  1.0;
       }
-      // 影像中x、y方向上的rgb差值
+
       vec_3 obs_rgb_dx, obs_rgb_dy;
-      // 投影点从影像插值获取rgb，计算x、y方向上的rgb差值
+      // 通过双线性插值获取该点的rgb值，同时获取该点x、y方向上的rgb的梯度
       vec_3 obs_rgb = image->get_rgb(pt_img_proj(0), pt_img_proj(1), 0,
                                      &obs_rgb_dx, &obs_rgb_dy);
-      //rgb误差: 图像对应点rgb - 地图点rgb 
+      // rgb误差: 图像对应点rgb - 地图点rgb
       vec_3 photometric_err_vec = (obs_rgb - pt_rgb);
+      // 套一层huber核
       double huber_loss_scale =
           get_huber_loss_scale(photometric_err_vec.norm());
       photometric_err_vec *= huber_loss_scale;
-      //影像误差 e^T * info_rgb(map) * e
+
+      //误差 e^T * info_rgb(map) * e
+      // TODO：为什么这么求？
       double photometric_err =
           photometric_err_vec.transpose() * pt_rgb_info * photometric_err_vec;
-
       acc_photometric_error += photometric_err;
-
       last_reprojection_error_vec[pt_idx] = photometric_err;
 
+      // 对像素坐标进行求导
       mat_photometric.setZero();
       mat_photometric.col(0) = obs_rgb_dx;
       mat_photometric.col(1) = obs_rgb_dy;
 
       avail_pt_count++;
+      // 投影模型，对相机坐标系求导数
       mat_pre << fx / pt_3d_cam(2), 0, -fx * pt_3d_cam(0) / pt_3d_cam(2), 0,
           fy / pt_3d_cam(2), -fy * pt_3d_cam(1) / pt_3d_cam(2);
       mat_d_pho_d_img = mat_photometric * mat_pre;
@@ -966,12 +1030,17 @@ bool R3LIVE::vio_photometric(StatesGroup &state_in, Rgbmap_tracker &op_track,
       mat_B = -state_iter.rot_ext_i2c.transpose() * (R_imu.transpose());
       mat_C = Sophus::SO3d::hat(pt_3d_cam);
       mat_D = -state_iter.rot_ext_i2c.transpose();
+
+      //残差向量填充
       meas_vec.block(pt_idx * 3, 0, 3, 1) = photometric_err_vec;
 
+      //构造H矩阵
       H_mat.block(pt_idx * 3, 0, 3, 3) =
           mat_d_pho_d_img * mat_A * huber_loss_scale;
       H_mat.block(pt_idx * 3, 3, 3, 3) =
           mat_d_pho_d_img * mat_B * huber_loss_scale;
+      // 只有外参数
+      // TODO：为什么不再对内参数、时间求导
       if (1) {
         if (m_if_estimate_i2c_extrinsic) {
           H_mat.block(pt_idx * 3, 18, 3, 3) =
@@ -981,19 +1050,28 @@ bool R3LIVE::vio_photometric(StatesGroup &state_in, Rgbmap_tracker &op_track,
         }
       }
     }
+    // 循环结束
+
+    // 稀疏的R矩阵
     R_mat_inv_spa = R_mat_inv.sparseView();
 
     last_avr_repro_err = acc_photometric_error;
+
     if (avail_pt_count < minimum_iteration_pts) {
       break;
     }
     // Esikf
     tim.tic("Iter");
     if (if_esikf) {
+      // TODO:为什么frame-to-frame的更新没有用R
+      // H
       H_mat_spa = H_mat.sparseView();
+      // H^T
       Eigen::SparseMatrix<double> Hsub_T_temp_mat = H_mat_spa.transpose();
       vec_spa = (state_iter - state_in).sparseView();
+      // H^T * R^-1 * H
       H_T_H_spa = Hsub_T_temp_mat * R_mat_inv_spa * H_mat_spa;
+      // (H^T * R^-1 * H + (P * w)^-1 )^-1
       Eigen::SparseMatrix<double> temp_inv_mat =
           (H_T_H_spa.toDense() +
            (state_in.cov * m_cam_measurement_weight).inverse())
@@ -1001,8 +1079,12 @@ bool R3LIVE::vio_photometric(StatesGroup &state_in, Rgbmap_tracker &op_track,
               .sparseView();
       // ( H_T_H_spa.toDense() + ( state_in.cov ).inverse()
       // ).inverse().sparseView();
+      // H^T * R^-1
       Eigen::SparseMatrix<double> Ht_R_inv = (Hsub_T_temp_mat * R_mat_inv_spa);
+      // (H^T * R^-1 * H + (P * w)^-1 )^-1 * H^T * R^-1 * H
       KH_spa = temp_inv_mat * Ht_R_inv * H_mat_spa;
+      // (H^T * R^-1 * H + (P * w)^-1 )^-1 * (H^T * R^-1 * -Z) - (I - (H^T *
+      // R^-1 * H + (P * w)^-1 )^-1 * H^T * R^-1 * H) * (X_k - X_0)
       solution = (temp_inv_mat * (Ht_R_inv * ((-1 * meas_vec.sparseView()))) -
                   (I_STATE_spa - KH_spa) * vec_spa)
                      .toDense();
@@ -1013,17 +1095,18 @@ bool R3LIVE::vio_photometric(StatesGroup &state_in, Rgbmap_tracker &op_track,
          << acc_photometric_error / total_pt_size << endl;
     cout << "Solved solution: " << solution.transpose() << endl;
 #else
-    if ((acc_photometric_error / total_pt_size) < 10) // By experience.
-    {
+    // By experience.
+    if ((acc_photometric_error / total_pt_size) < 10) {
       break;
     }
 #endif
+
     if (fabs(acc_photometric_error - last_repro_err) < 0.01) {
       break;
     }
     last_repro_err = acc_photometric_error;
   }
-  
+  // 卡尔曼迭代结束
   if (if_esikf && avail_pt_count >= minimum_iteration_pts) {
     state_iter.cov =
         ((I_STATE_spa - KH_spa) * state_iter.cov.sparseView()).toDense();
@@ -1229,6 +1312,7 @@ void R3LIVE::service_VIO_update() {
     tim.tic("Frame");
     tim.tic("Track_img");
     StatesGroup state_out;
+    // TODO::设置原则是什么
     m_cam_measurement_weight =
         std::max(0.001, std::min(5.0 / m_number_of_new_visited_voxel, 0.01));
     if (vio_preintegration(g_lio_state, state_out,
